@@ -12,7 +12,7 @@ fn rec_props(extra: Value) -> Value {
     let mut props = json!({
         "fps": { "type": "integer", "description": "Frames per second (30 or 60). Default: user setting." },
         "quality": { "type": "string", "enum": ["maxima", "alta"], "description": "maxima = best image, alta = smaller file." },
-        "monitor": { "type": "integer", "description": "Monitor index, 0 = primary." },
+        "monitor": { "type": "integer", "description": "Monitor index from list_monitors. Omit = user default (usually the monitor under the mouse pointer)." },
         "audio": { "type": "array", "items": { "type": "string" },
                    "description": "Audio device names from list_audio_devices. [] = no audio. Omit = user default." },
         "name": { "type": "string", "description": "Output file name without extension." }
@@ -41,13 +41,16 @@ fn tools() -> Value {
         { "name": "take_screenshot",
           "description": "Save a full-resolution PNG screenshot and return its path (plus a preview image).",
           "inputSchema": { "type": "object", "properties": {
-              "monitor": { "type": "integer", "description": "Monitor index, 0 = primary." },
+              "monitor": { "type": "integer", "description": "Monitor index from list_monitors. Omit = user default." },
               "include_image": { "type": "boolean", "description": "Attach a 1280px JPEG preview. Default true." } } } },
         { "name": "list_recordings",
           "description": "List the most recent recordings (path, size in MB, date).",
           "inputSchema": { "type": "object", "properties": { "limit": { "type": "integer", "description": "Default 10." } } } },
         { "name": "list_audio_devices",
           "description": "List audio input devices usable in the audio parameter.",
+          "inputSchema": { "type": "object", "properties": {} } },
+        { "name": "list_monitors",
+          "description": "List monitors (index, position, native resolution) and which one would be recorded right now.",
           "inputSchema": { "type": "object", "properties": {} } }
     ])
 }
@@ -72,6 +75,7 @@ fn call(params: &Value, worker: &Path) -> Value {
         "recording_status" => text(Ok(core::status())),
         "list_recordings" => text(Ok(core::list_recordings(args["limit"].as_u64().unwrap_or(10) as usize))),
         "list_audio_devices" => text(core::audio_devices()),
+        "list_monitors" => text(Ok(json!({ "monitors": core::monitors(), "current": core::target_monitor() }))),
         "take_screenshot" => {
             let monitor = args["monitor"].as_u64().map(|m| m as u32);
             match core::screenshot(monitor) {

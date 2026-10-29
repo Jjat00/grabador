@@ -40,8 +40,16 @@ enum Cmd {
     },
     /// Dispositivos de audio disponibles
     Devices,
+    /// Monitores disponibles y el que se grabaría ahora
+    Monitors,
     /// Ver o cambiar los valores por defecto
-    Config(BaseArgs),
+    Config {
+        #[command(flatten)]
+        base: BaseArgs,
+        /// Grabar el monitor donde esté el puntero (se desactiva al fijar --monitor)
+        #[arg(long)]
+        follow_mouse: bool,
+    },
     /// Arranca el servidor MCP (stdio)
     Mcp,
     #[command(name = "__worker", hide = true)]
@@ -56,7 +64,7 @@ struct BaseArgs {
     /// maxima = mejor imagen, alta = archivo más ligero
     #[arg(long, value_parser = ["maxima", "alta"])]
     quality: Option<String>,
-    /// Índice del monitor (0 = principal)
+    /// Índice del monitor (por defecto: el del puntero). Ver: grabador monitors
     #[arg(long)]
     monitor: Option<u32>,
     /// Dispositivo de audio a incluir (repetible). Ver: grabador devices
@@ -126,14 +134,22 @@ fn main() {
         Cmd::Screenshot { monitor } => print(core::screenshot(monitor).map(|file| serde_json::json!({ "file": file }))),
         Cmd::List { n } => print(Ok(core::list_recordings(n))),
         Cmd::Devices => print(core::audio_devices()),
-        Cmd::Config(args) => {
+        Cmd::Monitors => print(Ok(serde_json::json!({
+            "monitors": core::monitors(),
+            "current": core::target_monitor(),
+        }))),
+        Cmd::Config { base: args, follow_mouse } => {
             let mut cfg = core::get_config();
             if let Some(audio) = args.audio() {
                 cfg.audio = audio;
             }
+            if let Some(m) = args.monitor {
+                cfg.monitor = m;
+                cfg.follow_mouse = false;
+            }
+            cfg.follow_mouse |= follow_mouse;
             cfg.fps = args.fps.unwrap_or(cfg.fps);
             cfg.quality = args.quality.unwrap_or(cfg.quality);
-            cfg.monitor = args.monitor.unwrap_or(cfg.monitor);
             cfg.out_dir = args.out.unwrap_or(cfg.out_dir);
             core::save_config(&cfg);
             print(Ok(cfg));

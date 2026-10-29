@@ -9,7 +9,6 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
 use windows::Win32::Graphics::Gdi::{BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, PAINTSTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
@@ -43,18 +42,9 @@ impl Drop for Overlay {
     }
 }
 
-/// Rectángulo (en píxeles físicos) de la salida que usa ddagrab con `output_idx`.
-fn monitor_rect(index: u32) -> Option<RECT> {
-    unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-        let output = factory.EnumAdapters1(0).ok()?.EnumOutputs(index).ok()?;
-        Some(output.GetDesc().ok()?.DesktopCoordinates)
-    }
-}
-
 unsafe fn run(monitor: u32, stop: &AtomicBool) {
     SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    let Some(r) = monitor_rect(monitor) else { return };
+    let Some(m) = crate::monitors().into_iter().find(|m| m.index == monitor) else { return };
     let Ok(module) = GetModuleHandleW(None) else { return };
     let class = w!("GrabadorOverlay");
     RegisterClassW(&WNDCLASSW { lpfnWndProc: Some(wndproc), hInstance: module.into(), lpszClassName: class, ..Default::default() });
@@ -64,10 +54,10 @@ unsafe fn run(monitor: u32, stop: &AtomicBool) {
         class,
         w!("Grabador"),
         WS_POPUP,
-        r.left,
-        r.top,
-        r.right - r.left,
-        r.bottom - r.top,
+        m.x,
+        m.y,
+        m.width as i32,
+        m.height as i32,
         None,
         None,
         Some(module.into()),

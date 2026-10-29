@@ -1,8 +1,11 @@
-use grabador_core::{self as core, Config, Options, Recording, State};
+use grabador_core::{self as core, Config, Monitor, Options, PreviewStream, Recording, State};
+use serde::Serialize;
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 use tauri::ipc::Response;
+use tauri::{AppHandle, Manager};
 
 type Res<T> = Result<T, String>;
 
@@ -23,9 +26,36 @@ fn explorer(arg: String) -> Res<()> {
     Command::new("explorer").raw_arg(arg).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
+/// Mantiene la vista previa en vivo mientras no se graba: sigue al monitor
+/// elegido (o al del puntero) y se pausa con la ventana minimizada.
+fn keep_preview(app: AppHandle) {
+    let mut stream: Option<PreviewStream> = None;
+    loop {
+        let minimized = app.get_webview_window("main").is_some_and(|w| w.is_minimized().unwrap_or(false));
+        let wanted = (!minimized && !core::status().is_active()).then(core::target_monitor);
+        if stream.as_mut().is_some_and(|s| Some(s.monitor()) != wanted || !s.alive()) {
+            stream = None;
+        }
+        if let (None, Some(monitor)) = (&stream, wanted) {
+            stream = PreviewStream::start(monitor).ok();
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+#[derive(Serialize)]
+struct AppStatus {
+    #[serde(flatten)]
+    state: State,
+    /// Monitor que se está grabando, o el que se grabaría ahora.
+    target: u32,
+}
+
 #[tauri::command]
-fn status() -> State {
-    core::status()
+fn status() -> AppStatus {
+    let state = core::status();
+    let target = state.monitor.filter(|_| state.is_active()).unwrap_or_else(core::target_monitor);
+    AppStatus { state, target }
 }
 
 #[tauri::command]
@@ -37,6 +67,11 @@ fn get_config() -> Config {
 fn set_config(config: Config) -> Config {
     core::save_config(&config);
     config
+}
+
+#[tauri::command]
+fn monitors() -> Vec<Monitor> {
+    core::monitors()
 }
 
 #[tauri::command]
@@ -60,16 +95,10 @@ async fn screenshot() -> Res<String> {
     blocking(|| core::screenshot(None)).await
 }
 
-/// Cuadro actual de la grabación en curso (JPEG); vacío si no se está grabando.
+/// Cuadro actual de la vista previa (JPEG); vacío si todavía no hay.
 #[tauri::command]
 fn live_preview() -> Response {
     Response::new(core::live_preview().unwrap_or_default())
-}
-
-/// Imagen actual de un monitor (JPEG) para la vista previa en reposo.
-#[tauri::command]
-async fn snapshot(monitor: Option<u32>) -> Res<Response> {
-    blocking(move || core::snapshot(monitor, 480)).await.map(Response::new)
 }
 
 #[tauri::command]
@@ -96,8 +125,13 @@ fn open_folder() -> Res<()> {
 
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            let handle = app.handle().clone();
+            std::thread::spawn(move || keep_preview(handle));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
-            status, get_config, set_config, devices, start, stop, screenshot, live_preview, snapshot, recordings,
+            status, get_config, set_config, monitors, devices, start, stop, screenshot, live_preview, recordings,
             open_file, reveal, open_folder
         ])
         .run(tauri::generate_context!())

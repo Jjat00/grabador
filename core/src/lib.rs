@@ -5,6 +5,9 @@
 //! así cualquier interfaz ve (y puede detener) una grabación iniciada por otra.
 
 mod overlay;
+mod preview;
+
+pub use preview::PreviewStream;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs::{self, File};
@@ -55,6 +58,13 @@ fn log_file() -> PathBuf {
 fn preview_file() -> PathBuf {
     app_dir().join("preview.jpg")
 }
+fn idle_preview_file() -> PathBuf {
+    app_dir().join("preview_idle.jpg")
+}
+
+// Vista previa: JPEG de 480 px que ffmpeg sobrescribe de forma atómica.
+const PREVIEW_SCALE: &str = "scale=480:-2,format=yuvj420p";
+const PREVIEW_OUTPUT: [&str; 10] = ["-c:v", "mjpeg", "-q:v", "5", "-f", "image2", "-update", "1", "-atomic_writing", "1"];
 
 // ---------- tipos ----------
 
@@ -65,6 +75,8 @@ pub struct Config {
     /// "maxima" (mejor imagen) o "alta" (archivo más ligero)
     pub quality: String,
     pub monitor: u32,
+    /// Grabar el monitor donde está el puntero (ignora `monitor`)
+    pub follow_mouse: bool,
     /// Dispositivos de audio dshow (sistema y/o micrófono)
     pub audio: Vec<String>,
     pub out_dir: String,
@@ -78,6 +90,7 @@ impl Default for Config {
             fps: 60,
             quality: "maxima".into(),
             monitor: 0,
+            follow_mouse: true,
             audio: vec![],
             out_dir: env_path("USERPROFILE").join("Videos").join("Grabador").to_string_lossy().into(),
             encoder: None,
@@ -124,6 +137,8 @@ pub struct State {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fps: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encoder: Option<String>,
@@ -148,6 +163,16 @@ impl State {
     pub fn is_active(&self) -> bool {
         matches!(self.status.as_str(), "starting" | "recording" | "finishing")
     }
+}
+
+/// Una salida de video tal como la ve ddagrab (`output_idx`), en píxeles físicos.
+#[derive(Serialize, Clone, Debug)]
+pub struct Monitor {
+    pub index: u32,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -226,6 +251,66 @@ pub fn ffmpeg() -> Result<PathBuf> {
         .ok_or_else(|| "No se encontró ffmpeg. Instálalo con: winget install ffmpeg".into())
 }
 
+// ---------- monitores ----------
+
+/// Ejecuta `f` con este hilo en modo DPI por monitor, para que Windows dé
+/// coordenadas en píxeles físicos (si no, con escala 150% 1920×1200 sale 1280×800).
+fn physical_pixels<T>(f: impl FnOnce() -> T) -> T {
+    use windows::Win32::UI::HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+    unsafe {
+        let prev = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let out = f();
+        if !prev.is_invalid() {
+            SetThreadDpiAwarenessContext(prev);
+        }
+        out
+    }
+}
+
+pub fn monitors() -> Vec<Monitor> {
+    physical_pixels(dxgi_outputs)
+}
+
+fn dxgi_outputs() -> Vec<Monitor> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
+    unsafe {
+        let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() else { return vec![] };
+        let Ok(adapter) = factory.EnumAdapters1(0) else { return vec![] };
+        (0..)
+            .map_while(|i| adapter.EnumOutputs(i).ok().and_then(|o| o.GetDesc().ok()).map(|d| (i, d.DesktopCoordinates)))
+            .map(|(index, r)| Monitor {
+                index,
+                x: r.left,
+                y: r.top,
+                width: (r.right - r.left) as u32,
+                height: (r.bottom - r.top) as u32,
+            })
+            .collect()
+    }
+}
+
+/// Monitor donde está el puntero del mouse.
+pub fn cursor_monitor() -> Option<u32> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut p = POINT::default();
+    physical_pixels(|| unsafe { GetCursorPos(&mut p) }).ok()?;
+    monitors()
+        .into_iter()
+        .find(|m| p.x >= m.x && p.x < m.x + m.width as i32 && p.y >= m.y && p.y < m.y + m.height as i32)
+        .map(|m| m.index)
+}
+
+/// Monitor a grabar: el del puntero si `follow_mouse`, si no el configurado.
+pub fn target_monitor() -> u32 {
+    let cfg = get_config();
+    if cfg.follow_mouse {
+        cursor_monitor().unwrap_or(cfg.monitor)
+    } else {
+        cfg.monitor
+    }
+}
+
 // ---------- configuración ----------
 
 pub fn get_config() -> Config {
@@ -292,7 +377,7 @@ fn build_args(job: &Job, output: &Path) -> Vec<String> {
         a.push(format!("audio={dev}"));
     }
 
-    let mut graph = format!("[0:v]split=2[cap][pv];[cap]format={pix}[v];[pv]fps=4,scale=480:-2,format=yuvj420p[p]");
+    let mut graph = format!("[0:v]split=2[cap][pv];[cap]format={pix}[v];[pv]fps=4,{PREVIEW_SCALE}[p]");
     let audio_map = match job.audio.len() {
         0 => None,
         1 => Some("1:a".to_string()),
@@ -312,24 +397,11 @@ fn build_args(job: &Job, output: &Path) -> Vec<String> {
     a.extend(limit.clone());
     a.push(output.to_string_lossy().into());
 
-    a.extend(["-map", "[p]", "-c:v", "mjpeg", "-q:v", "5", "-f", "image2", "-update", "1", "-atomic_writing", "1"].map(String::from));
+    a.extend(["-map".into(), "[p]".into()]);
+    a.extend(PREVIEW_OUTPUT.map(String::from));
     a.extend(limit);
     a.push(preview_file().to_string_lossy().into());
     a
-}
-
-/// Ejecuta ffmpeg y devuelve un JPEG (en memoria) de como máximo `max_width` px.
-fn jpeg(input: &[String], max_width: u32) -> Result<Vec<u8>> {
-    let out = hidden(&ffmpeg()?)
-        .args(["-hide_banner", "-loglevel", "error"])
-        .args(input)
-        .args(["-frames:v", "1", "-vf", &format!("scale='min({max_width},iw)':-2"), "-q:v", "4", "-f", "mjpeg", "-"])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.stdout.is_empty() {
-        return Err(format!("No se pudo generar la imagen: {}", String::from_utf8_lossy(&out.stderr).trim()));
-    }
-    Ok(out.stdout)
 }
 
 // ---------- API pública ----------
@@ -364,7 +436,7 @@ pub fn start(opts: Options, worker_exe: &Path) -> Result<State> {
     let job = Job {
         fps: opts.fps.unwrap_or(cfg.fps).clamp(1, 240),
         quality: opts.quality.unwrap_or(cfg.quality),
-        monitor: opts.monitor.unwrap_or(cfg.monitor),
+        monitor: opts.monitor.unwrap_or_else(target_monitor),
         audio: opts.audio.unwrap_or(cfg.audio),
         out_dir: opts.out_dir.unwrap_or(cfg.out_dir),
         duration: opts.duration,
@@ -440,7 +512,7 @@ pub fn screenshot(monitor: Option<u32>) -> Result<String> {
     let path = dir.join(chrono::Local::now().format("captura_%Y-%m-%d_%H-%M-%S.png").to_string());
     let out = hidden(&ffmpeg()?)
         .args(["-hide_banner", "-loglevel", "error", "-y"])
-        .args(capture_input(monitor.unwrap_or(cfg.monitor), 10))
+        .args(capture_input(monitor.unwrap_or_else(target_monitor), 10))
         .args(["-frames:v", "1", "-vf", "format=rgb24", "-update", "1"])
         .arg(&path)
         .output()
@@ -453,20 +525,22 @@ pub fn screenshot(monitor: Option<u32>) -> Result<String> {
 
 /// Versión JPEG reducida de una imagen (para mandarla a un agente sin pesar MB).
 pub fn preview_jpeg(path: &str, max_width: u32) -> Result<Vec<u8>> {
-    jpeg(&["-i".into(), path.into()], max_width)
-}
-
-/// Imagen pequeña y actual del monitor (para la vista previa cuando no se graba).
-pub fn snapshot(monitor: Option<u32>, max_width: u32) -> Result<Vec<u8>> {
-    jpeg(&capture_input(monitor.unwrap_or(get_config().monitor), 10), max_width)
-}
-
-/// Último cuadro de la vista previa en vivo, si hay una grabación en curso.
-pub fn live_preview() -> Option<Vec<u8>> {
-    if status().status != "recording" {
-        return None;
+    let out = hidden(&ffmpeg()?)
+        .args(["-hide_banner", "-loglevel", "error", "-i", path])
+        .args(["-vf", &format!("scale='min({max_width},iw)':-2"), "-q:v", "4", "-f", "mjpeg", "-"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.stdout.is_empty() {
+        return Err("No se pudo generar la vista previa".into());
     }
-    fs::read(preview_file()).ok()
+    Ok(out.stdout)
+}
+
+/// Último cuadro de la vista previa: el de la grabación en curso o, si no se
+/// graba, el de [`PreviewStream`].
+pub fn live_preview() -> Option<Vec<u8>> {
+    let file = if status().status == "recording" { preview_file() } else { idle_preview_file() };
+    fs::read(file).ok()
 }
 
 pub fn list_recordings(limit: usize) -> Vec<Recording> {
@@ -525,6 +599,7 @@ fn worker(job: &Job) -> Result<()> {
         pid: Some(std::process::id()), // el worker vive hasta terminar el MP4
         started_at: Some(started),
         file: Some(mp4.to_string_lossy().into()),
+        monitor: Some(job.monitor),
         fps: Some(job.fps),
         encoder: Some(job.encoder.clone()),
         audio: Some(job.audio.clone()),

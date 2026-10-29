@@ -1,5 +1,5 @@
 const { invoke } = window.__TAURI__.core;
-const { getCurrentWindow, availableMonitors, LogicalSize } = window.__TAURI__.window;
+const { getCurrentWindow, LogicalSize } = window.__TAURI__.window;
 const win = getCurrentWindow();
 const $ = (id) => document.getElementById(id);
 
@@ -21,10 +21,14 @@ const pad = (n) => String(n).padStart(2, "0");
 const clock = (s) => `${pad(Math.floor(s / 3600))}:${pad(Math.floor((s % 3600) / 60))}:${pad(Math.floor(s % 60))}`;
 const basename = (p) => p.split(/[\\/]/).pop();
 const isActive = (s) => ["starting", "recording", "finishing"].includes(s);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Monitor que se graba (o se grabaría) y su resolución nativa.
 function resolution() {
-  const m = monitors[cfg.monitor];
-  return m ? `${m.size.width}×${m.size.height}` : `${Math.round(screen.width * devicePixelRatio)}×${Math.round(screen.height * devicePixelRatio)}`;
+  const m = monitors.find((m) => m.index === state.target);
+  if (!m) return "";
+  const size = `${m.width}×${m.height}`;
+  return monitors.length > 1 ? `MONITOR ${m.index + 1} · ${size}` : size;
 }
 
 // Mensaje temporal en la línea de info: "error" u "ok".
@@ -72,20 +76,19 @@ async function showFrame(data) {
 async function refreshPreview() {
   if (previewBusy) return;
   previewBusy = true;
-  try {
-    const buffer = state.status === "recording"
-      ? await invoke("live_preview")
-      : await invoke("snapshot", { monitor: cfg.monitor });
-    await showFrame(buffer);
-  } catch { /* sin vista previa: se queda la anterior */ }
+  try { await showFrame(await invoke("live_preview")); }
+  catch { /* sin vista previa: se queda la anterior */ }
   previewBusy = false;
 }
 
 // ---------- ajustes ----------
 
+// Valor activo de cada selector; el de monitor es "auto" si sigue al puntero.
+const segValue = (key) => (key === "monitor" && cfg.follow_mouse ? "auto" : String(cfg[key]));
+
 function paintSegments() {
   document.querySelectorAll(".seg").forEach((seg) => {
-    seg.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.v === String(cfg[seg.dataset.key])));
+    seg.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.v === segValue(seg.dataset.key)));
   });
 }
 
@@ -93,15 +96,18 @@ async function saveConfig(patch) {
   cfg = await invoke("set_config", { config: { ...cfg, ...patch } });
   paintSegments();
   render();
-  if ("monitor" in patch) refreshPreview();
+}
+
+function segPatch(key, v) {
+  if (key === "quality") return { quality: v };
+  if (key === "monitor") return v === "auto" ? { follow_mouse: true } : { follow_mouse: false, monitor: Number(v) };
+  return { [key]: Number(v) };
 }
 
 document.querySelectorAll(".seg").forEach((seg) => {
   seg.addEventListener("click", (e) => {
     const v = e.target.closest("button")?.dataset.v;
-    if (v === undefined) return;
-    const key = seg.dataset.key;
-    saveConfig({ [key]: key === "quality" ? v : Number(v) });
+    if (v !== undefined) saveConfig(segPatch(seg.dataset.key, v));
   });
 });
 
@@ -123,11 +129,15 @@ async function loadAudio() {
   saveConfig({ audio: [...new Set([$("sys").value, $("mic").value].filter(Boolean))] });
 }));
 
+// Se vuelve a llamar cada pocos segundos por si conectas o desconectas una pantalla.
 async function loadMonitors() {
-  monitors = await availableMonitors().catch(() => []);
-  if (monitors.length < 2) return;
-  $("monitors").innerHTML = monitors.map((_, i) => `<button data-v="${i}">${i + 1}</button>`).join("");
-  $("monitorCell").classList.remove("hidden");
+  const list = await invoke("monitors").catch(() => []);
+  const changed = list.length !== monitors.length;
+  monitors = list;
+  if (!changed) return;
+  $("monitors").innerHTML = `<button data-v="auto">Auto</button>`
+    + monitors.map((m) => `<button data-v="${m.index}">${m.index + 1}</button>`).join("");
+  $("monitorCell").classList.toggle("hidden", monitors.length < 2);
   paintSegments();
 }
 
@@ -184,14 +194,12 @@ function tick() {
 }
 
 async function poll() {
-  const prev = state.status;
   try { state = await invoke("status"); } catch { return; }
   if (state.last_error && !isActive(state.status) && !busy) showError(state.last_error);
   if (state.last_file !== lastFile) {
     lastFile = state.last_file;
     loadLast();
   }
-  if (prev === "recording" && state.status !== "recording") refreshPreview();
   render();
 }
 
@@ -213,7 +221,6 @@ $("pin").onclick = async () => {
   await win.setAlwaysOnTop(pinned);
   $("pin").classList.toggle("on", pinned);
 };
-window.addEventListener("focus", () => state.status !== "recording" && refreshPreview());
 
 // ---------- inicio ----------
 
@@ -221,11 +228,16 @@ window.addEventListener("focus", () => state.status !== "recording" && refreshPr
   cfg = await invoke("get_config");
   paintSegments();
   await Promise.all([loadAudio(), loadMonitors(), poll()]);
-  await refreshPreview();
+  // Esperar el primer cuadro (máx. ~2 s) para mostrar la ventana ya con su tamaño final.
+  for (let i = 0; i < 10 && !$("preview").naturalWidth; i++) {
+    await refreshPreview();
+    if (!$("preview").naturalWidth) await sleep(200);
+  }
   await fitWindow();
   await win.center();
   await win.show();
   setInterval(poll, 500);
-  setInterval(() => state.status === "recording" && refreshPreview(), 250);
+  setInterval(refreshPreview, 250);
+  setInterval(loadMonitors, 3000);
   tick();
 })();
