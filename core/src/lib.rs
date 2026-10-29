@@ -4,6 +4,8 @@
 //! codifica por GPU cuando hay. El estado vive en `%LOCALAPPDATA%\tech.jaimeaza.grabador`,
 //! así cualquier interfaz ve (y puede detener) una grabación iniciada por otra.
 
+mod overlay;
+
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Write;
@@ -49,6 +51,9 @@ fn stop_flag() -> PathBuf {
 }
 fn log_file() -> PathBuf {
     app_dir().join("ffmpeg.log")
+}
+fn preview_file() -> PathBuf {
+    app_dir().join("preview.jpg")
 }
 
 // ---------- tipos ----------
@@ -185,30 +190,28 @@ fn hidden(program: &Path) -> Command {
 }
 
 fn pid_alive(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     unsafe {
-        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if h.is_null() {
-            return false;
-        }
+        let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return false };
         let mut code = 0u32;
-        GetExitCodeProcess(h, &mut code);
-        CloseHandle(h);
-        code == 259 // STILL_ACTIVE
+        let ok = GetExitCodeProcess(h, &mut code).is_ok();
+        let _ = CloseHandle(h);
+        ok && code == 259 // STILL_ACTIVE
     }
 }
 
 /// Evita que el worker herede stdin/stdout: si heredara el pipe de la terminal o
 /// del cliente MCP, éstos esperarían a que terminara la grabación.
 fn detach_std_handles() {
-    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    use windows::Win32::Foundation::{SetHandleInformation, HANDLE_FLAGS, HANDLE_FLAG_INHERIT};
+    use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
     unsafe {
         for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-            let h = GetStdHandle(id);
-            if !h.is_null() && h != INVALID_HANDLE_VALUE {
-                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            if let Ok(h) = GetStdHandle(id) {
+                if !h.is_invalid() {
+                    let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0));
+                }
             }
         }
     }
@@ -271,40 +274,62 @@ pub fn audio_devices() -> Result<Vec<String>> {
 
 // ---------- ffmpeg ----------
 
-fn capture_input(monitor: u32, fps: u32, pix: &str) -> Vec<String> {
-    let graph = format!("ddagrab=output_idx={monitor}:framerate={fps}:draw_mouse=1,hwdownload,format=bgra,format={pix}");
+fn capture_input(monitor: u32, fps: u32) -> Vec<String> {
+    let graph = format!("ddagrab=output_idx={monitor}:framerate={fps}:draw_mouse=1,hwdownload,format=bgra");
     vec!["-f".into(), "lavfi".into(), "-i".into(), graph]
 }
 
+/// Dos salidas: el video final y un JPEG pequeño que se sobrescribe (preview en vivo).
 fn build_args(job: &Job, output: &Path) -> Vec<String> {
     let (_, enc_args, pix) = ENCODERS.iter().find(|(n, _, _)| *n == job.encoder).unwrap_or(&ENCODERS[3]);
     let q = if job.quality == "alta" { "22" } else { "16" };
+    let limit: Vec<String> = job.duration.map(|d| vec!["-t".into(), d.to_string()]).unwrap_or_default();
+
     let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error", "-y"].map(String::from).to_vec();
-    a.extend(capture_input(job.monitor, job.fps, pix));
+    a.extend(capture_input(job.monitor, job.fps));
     for dev in &job.audio {
         a.extend(["-f", "dshow", "-thread_queue_size", "1024", "-audio_buffer_size", "50", "-i"].map(String::from));
         a.push(format!("audio={dev}"));
     }
-    a.extend(["-map".into(), "0:v".into()]);
-    match job.audio.len() {
-        0 => {}
-        1 => a.extend(["-map".into(), "1:a".into()]),
+
+    let mut graph = format!("[0:v]split=2[cap][pv];[cap]format={pix}[v];[pv]fps=4,scale=480:-2,format=yuvj420p[p]");
+    let audio_map = match job.audio.len() {
+        0 => None,
+        1 => Some("1:a".to_string()),
         n => {
             let ins: String = (1..=n).map(|i| format!("[{i}:a]")).collect();
-            a.extend(["-filter_complex".into(), format!("{ins}amix=inputs={n}:normalize=0[a]"), "-map".into(), "[a]".into()]);
+            graph.push_str(&format!(";{ins}amix=inputs={n}:normalize=0[a]"));
+            Some("[a]".to_string())
         }
+    };
+    a.extend(["-filter_complex".into(), graph, "-map".into(), "[v]".into()]);
+    if let Some(m) = audio_map {
+        a.extend(["-map".into(), m, "-c:a".into(), "aac".into(), "-b:a".into(), "192k".into()]);
     }
     a.extend(["-c:v".into(), job.encoder.clone()]);
     a.extend(enc_args.iter().map(|s| s.replace("{q}", q)));
     a.extend(["-g".into(), (job.fps * 2).to_string()]);
-    if !job.audio.is_empty() {
-        a.extend(["-c:a", "aac", "-b:a", "192k"].map(String::from));
-    }
-    if let Some(d) = job.duration {
-        a.extend(["-t".into(), d.to_string()]);
-    }
+    a.extend(limit.clone());
     a.push(output.to_string_lossy().into());
+
+    a.extend(["-map", "[p]", "-c:v", "mjpeg", "-q:v", "5", "-f", "image2", "-update", "1", "-atomic_writing", "1"].map(String::from));
+    a.extend(limit);
+    a.push(preview_file().to_string_lossy().into());
     a
+}
+
+/// Ejecuta ffmpeg y devuelve un JPEG (en memoria) de como máximo `max_width` px.
+fn jpeg(input: &[String], max_width: u32) -> Result<Vec<u8>> {
+    let out = hidden(&ffmpeg()?)
+        .args(["-hide_banner", "-loglevel", "error"])
+        .args(input)
+        .args(["-frames:v", "1", "-vf", &format!("scale='min({max_width},iw)':-2"), "-q:v", "4", "-f", "mjpeg", "-"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.stdout.is_empty() {
+        return Err(format!("No se pudo generar la imagen: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(out.stdout)
 }
 
 // ---------- API pública ----------
@@ -415,8 +440,8 @@ pub fn screenshot(monitor: Option<u32>) -> Result<String> {
     let path = dir.join(chrono::Local::now().format("captura_%Y-%m-%d_%H-%M-%S.png").to_string());
     let out = hidden(&ffmpeg()?)
         .args(["-hide_banner", "-loglevel", "error", "-y"])
-        .args(capture_input(monitor.unwrap_or(cfg.monitor), 10, "rgb24"))
-        .args(["-frames:v", "1", "-update", "1"])
+        .args(capture_input(monitor.unwrap_or(cfg.monitor), 10))
+        .args(["-frames:v", "1", "-vf", "format=rgb24", "-update", "1"])
         .arg(&path)
         .output()
         .map_err(|e| e.to_string())?;
@@ -428,15 +453,20 @@ pub fn screenshot(monitor: Option<u32>) -> Result<String> {
 
 /// Versión JPEG reducida de una imagen (para mandarla a un agente sin pesar MB).
 pub fn preview_jpeg(path: &str, max_width: u32) -> Result<Vec<u8>> {
-    let out = hidden(&ffmpeg()?)
-        .args(["-hide_banner", "-loglevel", "error", "-i", path])
-        .args(["-vf", &format!("scale='min({max_width},iw)':-2"), "-q:v", "4", "-f", "mjpeg", "-"])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.stdout.is_empty() {
-        return Err("No se pudo generar la vista previa".into());
+    jpeg(&["-i".into(), path.into()], max_width)
+}
+
+/// Imagen pequeña y actual del monitor (para la vista previa cuando no se graba).
+pub fn snapshot(monitor: Option<u32>, max_width: u32) -> Result<Vec<u8>> {
+    jpeg(&capture_input(monitor.unwrap_or(get_config().monitor), 10), max_width)
+}
+
+/// Último cuadro de la vista previa en vivo, si hay una grabación en curso.
+pub fn live_preview() -> Option<Vec<u8>> {
+    if status().status != "recording" {
+        return None;
     }
-    Ok(out.stdout)
+    fs::read(preview_file()).ok()
 }
 
 pub fn list_recordings(limit: usize) -> Vec<Recording> {
@@ -502,6 +532,7 @@ fn worker(job: &Job) -> Result<()> {
         ..Default::default()
     };
     write_json(&state_file(), &state);
+    let border = overlay::Overlay::show(job.monitor);
 
     let mut stop_sent: Option<Instant> = None;
     while child.try_wait().map_err(|e| e.to_string())?.is_none() {
@@ -519,6 +550,8 @@ fn worker(job: &Job) -> Result<()> {
         }
         sleep(Duration::from_millis(200));
     }
+    drop(border);
+    let _ = fs::remove_file(preview_file());
     let elapsed = round1(now() - started);
 
     if !fs::metadata(&mkv).is_ok_and(|m| m.len() > 0) {
