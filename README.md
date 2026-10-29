@@ -3,7 +3,8 @@
 Grabador de pantalla para Windows en alta resolución: app de escritorio minimalista, CLI y servidor MCP para agentes.
 
 - Resolución nativa, 30/60 FPS, codificación por GPU (NVENC, Quick Sync o AMF; si no hay, x264) → MP4.
-- Vista previa en vivo dentro de la app.
+- Vista previa en vivo dentro de la app, también antes de grabar.
+- Modo **Auto**: graba (y previsualiza) el monitor donde está el puntero; o fija uno.
 - Recuadro rojo sutil alrededor del monitor que se graba; **no sale en el video** (`WDA_EXCLUDEFROMCAPTURE`).
 - Audio del sistema y micrófono, mezclados.
 - App, CLI y MCP comparten estado: lo que inicia uno lo puede detener otro.
@@ -35,7 +36,8 @@ grabador status
 grabador screenshot
 grabador list [-n 10]
 grabador devices              # dispositivos de audio
-grabador config [--fps ...]   # valores por defecto
+grabador monitors             # monitores y el que se grabaría ahora
+grabador config [--fps ...] [--monitor 1 | --follow-mouse]   # valores por defecto
 ```
 
 ## MCP
@@ -44,6 +46,6 @@ grabador config [--fps ...]   # valores por defecto
 claude mcp add grabador -s user -- grabador mcp
 ```
 
-Herramientas: `start_recording`, `stop_recording`, `record_clip`, `recording_status`, `take_screenshot`, `list_recordings`, `list_audio_devices`.
+Herramientas: `start_recording`, `stop_recording`, `record_clip`, `recording_status`, `take_screenshot`, `list_recordings`, `list_audio_devices`, `list_monitors`.
 
 Las grabaciones se guardan en `~/Videos/Grabador`; el estado y la configuración, en `%LOCALAPPDATA%\tech.jaimeaza.grabador`.
