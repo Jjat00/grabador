@@ -1,0 +1,12 @@
+[package]
+name = "grabador"
+version = "1.0.0"
+edition = "2021"
+description = "CLI y servidor MCP del Grabador de pantalla"
+
+[dependencies]
+grabador-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap = { version = "4", features = ["derive"] }
+base64 = "0.22"

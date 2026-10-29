@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["core", "cli", "src-tauri"]
+
+[workspace.dependencies]
+grabador-core = { path = "core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

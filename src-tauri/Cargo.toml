@@ -1,0 +1,22 @@
+[package]
+name = "grabador-app"
+version = "1.0.0"
+edition = "2021"
+description = "Grabador de pantalla"
+
+[lib]
+name = "grabador_app_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+grabador-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = [] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
