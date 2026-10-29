@@ -3,14 +3,17 @@ const { getCurrentWindow, availableMonitors, LogicalSize } = window.__TAURI__.wi
 const win = getCurrentWindow();
 const $ = (id) => document.getElementById(id);
 
-const NONE = "";
+const MCP_COMMAND = "claude mcp add grabador -- grabador mcp";
 const SYSTEM_HINT = /desktop|stereo|estéreo|mix|loopback|what u hear|virtual audio/i;
 
 let cfg = {};
 let state = { status: "idle" };
-let lastFile = null;
+let monitors = [];
+let lastFile;
 let busy = false;
 let flashTimer;
+let previewUrl;
+let previewBusy = false;
 
 // ---------- utilidades ----------
 
@@ -18,15 +21,18 @@ const pad = (n) => String(n).padStart(2, "0");
 const clock = (s) => `${pad(Math.floor(s / 3600))}:${pad(Math.floor((s % 3600) / 60))}:${pad(Math.floor(s % 60))}`;
 const basename = (p) => p.split(/[\\/]/).pop();
 const isActive = (s) => ["starting", "recording", "finishing"].includes(s);
-const nativeRes = () => `${Math.round(screen.width * devicePixelRatio)}×${Math.round(screen.height * devicePixelRatio)}`;
 
-// Mensaje temporal en la línea de info: "error" o "ok".
+function resolution() {
+  const m = monitors[cfg.monitor];
+  return m ? `${m.size.width}×${m.size.height}` : `${Math.round(screen.width * devicePixelRatio)}×${Math.round(screen.height * devicePixelRatio)}`;
+}
+
+// Mensaje temporal en la línea de info: "error" u "ok".
 function flash(msg, kind = "error", ms = 5000) {
-  const meta = $("meta");
-  meta.textContent = msg;
-  meta.className = `meta ${kind}`;
+  $("meta").textContent = msg;
+  $("meta").className = `meta ${kind}`;
   clearTimeout(flashTimer);
-  flashTimer = setTimeout(() => { meta.className = "meta"; render(); }, ms);
+  flashTimer = setTimeout(() => { $("meta").className = "meta"; render(); }, ms);
 }
 const showError = (e) => flash(String(e));
 
@@ -37,6 +43,42 @@ async function run(fn) {
   try { await fn(); }
   catch (e) { showError(e); }
   finally { busy = false; await poll(); }
+}
+
+async function fitWindow() {
+  const height = Math.ceil($("app").getBoundingClientRect().height);
+  await win.setSize(new LogicalSize(400, height));
+}
+
+// ---------- vista previa ----------
+
+// Tauri entrega los bytes como ArrayBuffer o como Array según el comando.
+async function showFrame(data) {
+  const bytes = new Uint8Array(data ?? []);
+  if (!bytes.length) return;
+  const img = $("preview");
+  const url = URL.createObjectURL(new Blob([bytes], { type: "image/jpeg" }));
+  img.src = url;
+  await img.decode().catch(() => {});
+  if (previewUrl) URL.revokeObjectURL(previewUrl);
+  previewUrl = url;
+  const ratio = `${img.naturalWidth} / ${img.naturalHeight}`;
+  if (img.naturalWidth && $("screen").style.aspectRatio !== ratio) {
+    $("screen").style.aspectRatio = ratio;
+    fitWindow();
+  }
+}
+
+async function refreshPreview() {
+  if (previewBusy) return;
+  previewBusy = true;
+  try {
+    const buffer = state.status === "recording"
+      ? await invoke("live_preview")
+      : await invoke("snapshot", { monitor: cfg.monitor });
+    await showFrame(buffer);
+  } catch { /* sin vista previa: se queda la anterior */ }
+  previewBusy = false;
 }
 
 // ---------- ajustes ----------
@@ -51,6 +93,7 @@ async function saveConfig(patch) {
   cfg = await invoke("set_config", { config: { ...cfg, ...patch } });
   paintSegments();
   render();
+  if ("monitor" in patch) refreshPreview();
 }
 
 document.querySelectorAll(".seg").forEach((seg) => {
@@ -64,8 +107,8 @@ document.querySelectorAll(".seg").forEach((seg) => {
 
 function fillSelect(el, devices, value) {
   el.innerHTML = "";
-  [[NONE, "Ninguno"], ...devices.map((d) => [d, d])].forEach(([v, label]) => el.add(new Option(label, v)));
-  el.value = devices.includes(value) ? value : NONE;
+  [["", "Ninguno"], ...devices.map((d) => [d, d])].forEach(([v, label]) => el.add(new Option(label, v)));
+  el.value = devices.includes(value) ? value : "";
 }
 
 async function loadAudio() {
@@ -77,38 +120,33 @@ async function loadAudio() {
 }
 
 ["sys", "mic"].forEach((id) => $(id).addEventListener("change", () => {
-  const audio = [...new Set([$("sys").value, $("mic").value].filter(Boolean))];
-  saveConfig({ audio });
+  saveConfig({ audio: [...new Set([$("sys").value, $("mic").value].filter(Boolean))] });
 }));
 
 async function loadMonitors() {
-  const monitors = await availableMonitors().catch(() => []);
+  monitors = await availableMonitors().catch(() => []);
   if (monitors.length < 2) return;
   $("monitors").innerHTML = monitors.map((_, i) => `<button data-v="${i}">${i + 1}</button>`).join("");
   $("monitorCell").classList.remove("hidden");
   paintSegments();
 }
 
-// ---------- recientes ----------
+// ---------- última grabación ----------
 
-async function loadRecent() {
-  const list = await invoke("recordings", { limit: 2 });
-  const ul = $("recent");
-  if (!list.length) {
-    ul.innerHTML = `<li class="empty">Aún no hay grabaciones</li>`;
-    return;
-  }
-  ul.innerHTML = "";
-  list.forEach((r) => {
-    const li = document.createElement("li");
-    li.title = "Clic: reproducir · Clic derecho: mostrar en carpeta";
-    li.innerHTML = `<span class="name"></span><span class="size">${r.size_mb} MB</span><span class="go">↗</span>`;
-    li.querySelector(".name").textContent = basename(r.file);
-    li.onclick = () => invoke("open_file", { path: r.file }).catch(showError);
-    li.oncontextmenu = (e) => { e.preventDefault(); invoke("reveal", { path: r.file }).catch(showError); };
-    ul.append(li);
-  });
+async function loadLast() {
+  const [r] = await invoke("recordings", { limit: 1 });
+  const btn = $("last");
+  btn.disabled = !r;
+  btn.dataset.file = r?.file ?? "";
+  btn.querySelector(".name").textContent = r ? basename(r.file) : "Aún no hay grabaciones";
+  btn.querySelector(".size").textContent = r ? `${r.size_mb} MB` : "";
 }
+
+$("last").onclick = () => invoke("open_file", { path: $("last").dataset.file }).catch(showError);
+$("last").oncontextmenu = (e) => {
+  e.preventDefault();
+  if ($("last").dataset.file) invoke("reveal", { path: $("last").dataset.file }).catch(showError);
+};
 
 // ---------- estado ----------
 
@@ -119,18 +157,21 @@ function render() {
   document.body.classList.toggle("busy", busy || s === "starting" || s === "finishing");
   $("settings").classList.toggle("locked", active || busy);
 
-  const chip = { idle: "Listo", starting: "Iniciando", recording: "Rec", finishing: "Guardando" }[s] || "Listo";
-  $("chip").querySelector("b").textContent = busy && !active ? "Iniciando" : chip;
+  const chip = { starting: "Iniciando", recording: "Rec", finishing: "Guardando" }[s] ?? (busy ? "Iniciando" : "Listo");
+  $("chip").querySelector("b").textContent = chip;
   $("recText").textContent = active ? "Detener" : "Grabar";
   $("rec").disabled = busy || s === "starting" || s === "finishing";
   $("shot").disabled = busy;
+  $("res").textContent = resolution();
 
   if ($("meta").className === "meta") {
-    const fps = state.fps ?? cfg.fps;
     const audio = (state.audio ?? cfg.audio ?? []).length;
-    const parts = [nativeRes(), `${fps} FPS`, (state.encoder ?? cfg.encoder ?? "H264").toUpperCase()];
-    parts.push(audio ? `AUDIO ×${audio}` : "SIN AUDIO");
-    $("meta").textContent = parts.join(" · ");
+    $("meta").textContent = [
+      `${state.fps ?? cfg.fps} FPS`,
+      (state.encoder ?? cfg.encoder ?? "H264").toUpperCase(),
+      cfg.quality === "alta" ? "LIGERA" : "CALIDAD MÁX",
+      audio ? `AUDIO ×${audio}` : "SIN AUDIO",
+    ].join(" · ");
   }
   if (!active) $("timer").textContent = clock(0);
 }
@@ -143,27 +184,25 @@ function tick() {
 }
 
 async function poll() {
+  const prev = state.status;
   try { state = await invoke("status"); } catch { return; }
   if (state.last_error && !isActive(state.status) && !busy) showError(state.last_error);
   if (state.last_file !== lastFile) {
     lastFile = state.last_file;
-    loadRecent();
+    loadLast();
   }
+  if (prev === "recording" && state.status !== "recording") refreshPreview();
   render();
 }
 
 // ---------- acciones ----------
 
 $("rec").onclick = () => run(() => invoke(isActive(state.status) ? "stop" : "start"));
-$("shot").onclick = () => run(async () => {
-  const file = await invoke("screenshot");
-  flash(`✓ ${basename(file)}`, "ok", 3000);
-});
+$("shot").onclick = () => run(async () => flash(`✓ ${basename(await invoke("screenshot"))}`, "ok", 3000));
 $("folder").onclick = () => invoke("open_folder").catch(showError);
-$("copy").onclick = async () => {
-  await navigator.clipboard.writeText($("mcpCmd").textContent);
-  $("copy").textContent = "Copiado";
-  setTimeout(() => ($("copy").textContent = "Copiar"), 1500);
+$("mcp").onclick = async () => {
+  await navigator.clipboard.writeText(MCP_COMMAND);
+  flash(`✓ Copiado: ${MCP_COMMAND}`, "ok", 3500);
 };
 
 $("min").onclick = () => win.minimize();
@@ -174,6 +213,7 @@ $("pin").onclick = async () => {
   await win.setAlwaysOnTop(pinned);
   $("pin").classList.toggle("on", pinned);
 };
+window.addEventListener("focus", () => state.status !== "recording" && refreshPreview());
 
 // ---------- inicio ----------
 
@@ -181,10 +221,11 @@ $("pin").onclick = async () => {
   cfg = await invoke("get_config");
   paintSegments();
   await Promise.all([loadAudio(), loadMonitors(), poll()]);
-  const height = Math.ceil(document.getElementById("app").getBoundingClientRect().height);
-  await win.setSize(new LogicalSize(400, height));
+  await refreshPreview();
+  await fitWindow();
   await win.center();
   await win.show();
   setInterval(poll, 500);
+  setInterval(() => state.status === "recording" && refreshPreview(), 250);
   tick();
 })();

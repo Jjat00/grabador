@@ -2,6 +2,7 @@ use grabador_core::{self as core, Config, Options, Recording, State};
 use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
+use tauri::ipc::Response;
 
 type Res<T> = Result<T, String>;
 
@@ -59,6 +60,18 @@ async fn screenshot() -> Res<String> {
     blocking(|| core::screenshot(None)).await
 }
 
+/// Cuadro actual de la grabación en curso (JPEG); vacío si no se está grabando.
+#[tauri::command]
+fn live_preview() -> Response {
+    Response::new(core::live_preview().unwrap_or_default())
+}
+
+/// Imagen actual de un monitor (JPEG) para la vista previa en reposo.
+#[tauri::command]
+async fn snapshot(monitor: Option<u32>) -> Res<Response> {
+    blocking(move || core::snapshot(monitor, 480)).await.map(Response::new)
+}
+
 #[tauri::command]
 fn recordings(limit: usize) -> Vec<Recording> {
     core::list_recordings(limit)
@@ -84,7 +97,8 @@ fn open_folder() -> Res<()> {
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
-            status, get_config, set_config, devices, start, stop, screenshot, recordings, open_file, reveal, open_folder
+            status, get_config, set_config, devices, start, stop, screenshot, live_preview, snapshot, recordings,
+            open_file, reveal, open_folder
         ])
         .run(tauri::generate_context!())
         .expect("error al iniciar Grabador");
